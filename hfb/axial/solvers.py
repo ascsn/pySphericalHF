@@ -1,15 +1,20 @@
 import numpy as np
 from scipy import special
-import sys
+import sys, os
 import math
 
 import warnings
+import traceback
+import tqdm
 
-from jax import jit, lax
-import jax
-jax.config.update("jax_enable_x64", True)
-import jax.numpy as jnp
+# from jax import jit, lax
+# import jax
+# jax.config.update("jax_enable_x64", True)
+# import jax.numpy as jnp
 from functools import partial
+
+import misc_physics as misc_phys
+import utils
 
 import itertools
 import pandas as pd
@@ -18,84 +23,11 @@ pd.options.mode.copy_on_write = True
 
 import time
 from scipy import optimize, linalg
+import h5py
 
 import matplotlib.pyplot as plt
 
-class GlobalVariables:
-    e2 = 1.43997840859651305 #electron charge squared
-    h2m = 20.7355300000 #$\hbar^2/2m$
-    printTimings = True
-    
-def timer(func):
-    if GlobalVariables.printTimings:
-        def inner(*args,**kwargs):
-            t0 = time.time()
-            ret = func(*args,**kwargs)
-            t1 = time.time()
-            
-            print(func.__name__+' time: %.3e s'%(t1-t0))
-            
-            return ret
-    else:
-        def inner(*args,**kwargs):
-            ret = func(*args,**kwargs)
-            return ret
-    return inner
-
-def symmetrize_array(arr):
-    #From https://stackoverflow.com/a/54277518
-    # return np.tril(arr) + np.triu(arr.T, 1)
-    return np.tril(arr) + np.triu(np.swapaxes(arr,-2,-1), 1)
-
-def plot_field(field,eta,xi,vmin=None,vmax=None,mesh=False,cmap='Spectral_r'):
-    fig, ax = plt.subplots()
-    if mesh:
-        cf = ax.pcolormesh(np.sqrt(eta),xi,field.T,cmap=cmap,vmin=vmin,vmax=vmax)
-    else:
-        if vmin is None or vmax is None:
-            levels = 30
-        else:
-            levels = np.linspace(vmin,vmax,num=30)
-        cf = ax.contourf(np.sqrt(eta),xi,field.T,cmap=cmap,vmin=vmin,vmax=vmax,
-                         extend='both',levels=levels)
-    plt.colorbar(cf,ax=ax)
-    ax.set(xlabel=r'$r/b_\perp$',ylabel=r'$z/b_z$')
-    
-    return fig, ax
-
-def side_by_side_density(arr1,arr2,eta,xi,titles=None,mesh=False,cmap='Spectral_r',
-                         vmin=None,vmax=None):
-    textboxProps = {"boxstyle":'round', "facecolor":'white', "alpha":1,'pad':0.2}
-    
-    fig, ax = plt.subplots()
-    
-    rHere = np.sqrt(eta)
-    arr = np.vstack([arr1[::-1],arr2])
-    rVals = np.hstack([-rHere[::-1],rHere])
-    if mesh:
-        cf = ax.pcolormesh(rVals,xi,arr.T,cmap=cmap,)
-    else:
-        if vmin is None or vmax is None:
-            levels = 30
-        else:
-            levels = np.linspace(vmin,vmax,num=30)
-        cf = ax.contourf(rVals,xi,arr.T,cmap=cmap,
-                         extend='both',
-                         levels=levels
-                         )
-    plt.colorbar(cf,ax=ax)
-    ax.axvline(0,color='black')
-    
-    ax.set(xlabel=r'$r/b_\perp$',ylabel=r'$z/b_z$')
-    
-    if titles is not None:
-        ax.text(0.02,0.97,titles[0],transform=ax.transAxes,
-                verticalalignment='top',horizontalalignment="left",
-                bbox=textboxProps,fontsize=8)
-        ax.text(0.97,0.97,titles[1],transform=ax.transAxes,
-                verticalalignment='top',horizontalalignment="right",
-                bbox=textboxProps,fontsize=8)
-    return fig, ax
+warnings.filterwarnings('ignore',message='Calling float on a single element Series')
 
 class CylindricalIntegral:
     def __init__(self,xi,eta,wz,wp):
@@ -161,53 +93,57 @@ class AxialMultipoleMoment(CylindricalIntegral):
         return self.integrate(inputArr*arr,bz,bp)
     
 class BaseSkyrme(CylindricalIntegral):
+    """
+    Note that the method 'rho' computes the variation with respect to $\rho$,
+    and so on and so forth
+    """
     def __init__(self,*args):
         super().__init__(*args)
         
     def get_energy(self,listOfFields,bz,bp):
         raise NotImplementedError
         
-    def var_rho(self,listOfFields,bz,bp,**kwargs):
+    def rho(self,listOfFields,bz,bp,**kwargs):
         shp = listOfFields[0].shape
         return 2*(np.zeros(shp),)
     
-    def var_dr_rho(self,listOfFields,bz,bp):
+    def dr_rho(self,listOfFields,bz,bp):
         shp = listOfFields[0].shape
         return 2*(np.zeros(shp),)
     
-    def var_dz_rho(self,listOfFields,bz,bp):
+    def dz_rho(self,listOfFields,bz,bp):
         shp = listOfFields[0].shape
         return 2*(np.zeros(shp),)
     
-    def var_del_rho(self,listOfFields,bz,bp):
+    def del_rho(self,listOfFields,bz,bp):
         shp = listOfFields[0].shape
         return 2*(np.zeros(shp),)
     
-    def var_tau(self,listOfFields,bz,bp):
+    def tau(self,listOfFields,bz,bp):
         shp = listOfFields[0].shape
         return 2*(np.zeros(shp),)
     
-    def var_div_J(self,listOfFields,bz,bp):
+    def divJ(self,listOfFields,bz,bp):
         shp = listOfFields[0].shape
         return 2*(np.zeros(shp),)
     
-    def var_J_fz(self,listOfFields,bz,bp):
+    def J_fz(self,listOfFields,bz,bp):
         shp = listOfFields[0].shape
         return 2*(np.zeros(shp),)
     
-    def var_J_zf(self,listOfFields,bz,bp):
+    def J_zf(self,listOfFields,bz,bp):
         shp = listOfFields[0].shape
         return 2*(np.zeros(shp),)
     
-    def var_J_fr(self,listOfFields,bz,bp):
+    def J_fr(self,listOfFields,bz,bp):
         shp = listOfFields[0].shape
         return 2*(np.zeros(shp),)
     
-    def var_J_rf(self,listOfFields,bz,bp):
+    def J_rf(self,listOfFields,bz,bp):
         shp = listOfFields[0].shape
         return 2*(np.zeros(shp),)
     
-    def var_rho_tilde(self,listOfFields,bz,bp):
+    def rho_tilde(self,listOfFields,bz,bp):
         shp = listOfFields[0].shape
         return 2*(np.zeros(shp),)
     
@@ -223,7 +159,7 @@ class AxialMultipoleConstraint(BaseSkyrme):
             coeff = 1/10.**l
         return coeff
     
-    def var_rho(self,listOfFields,bz,bp,l=None,lagrangeMultiplier=None):
+    def rho(self,listOfFields,bz,bp,l=None,lagrangeMultiplier=None):
         if l is None:
             raise ValueError('Provide an l value')
         if lagrangeMultiplier is None:
@@ -248,7 +184,7 @@ base class
 """
 class Skyrme_Kinetic(BaseSkyrme):
     def __init__(self,*args,
-                 coeff=2*[GlobalVariables.h2m,]):
+                 coeff=2*[utils.GlobalVariables.h2m,]):
         """
         The normal kinetic energy density, $\hbar^2/2m \tau$. By default,
         assumes equal proton and neutron mass, with value
@@ -263,7 +199,7 @@ class Skyrme_Kinetic(BaseSkyrme):
         taup, taun = listOfFields
         return self.coeff[0] * self.integrate(taup,bz,bp) + self.coeff[1] * self.integrate(taun,bz,bp)
     
-    def var_tau(self,listOfFields,bz,bp):
+    def tau(self,listOfFields,bz,bp):
         taup, taun = listOfFields
         return self.coeff[0]*np.ones(taup.shape), self.coeff[1]*np.ones(taun.shape)
     
@@ -282,7 +218,7 @@ class Skyrme_rho_rho(BaseSkyrme):
         return self.B1*self.integrate(rhoTot**2,bz,bp) + self.B2 * \
             self.integrate(rhop**2+rhon**2,bz,bp)
             
-    def var_rho(self,listOfFields,bz,bp):
+    def rho(self,listOfFields,bz,bp):
         rhop,rhon = listOfFields
         rhoTot = rhop+rhon
         
@@ -304,13 +240,13 @@ class Skyrme_rho_tau(BaseSkyrme):
         return self.B3 * self.integrate(rho*tau,bz,bp) + self.B4 * \
             self.integrate(rhop*taup + rhon*taun,bz,bp)
             
-    def var_rho(self,listOfFields,bz,bp):
+    def rho(self,listOfFields,bz,bp):
         rhop,rhon,taup,taun = listOfFields
         tau = taup+taun
         
         return self.B3*tau + self.B4*taup, self.B3*tau + self.B4*taun
     
-    def var_tau(self,listOfFields,bz,bp):
+    def tau(self,listOfFields,bz,bp):
         rhop,rhon,taup,taun = listOfFields
         
         rho = rhop + rhon
@@ -332,13 +268,13 @@ class Skyrme_rho_dRho(BaseSkyrme):
         return self.B5 * self.integrate(rho*drho,bz,bp) + self.B6*\
             self.integrate(rhop*drhop + rhon*drhon,bz,bp)
             
-    def var_rho(self,listOfFields,bz,bp):
+    def rho(self,listOfFields,bz,bp):
         rhop,rhon,drhop,drhon = listOfFields
         drho = drhop + drhon
         
         return self.B5*drho + self.B6*drhop, self.B5*drho + self.B6*drhon
     
-    def var_del_rho(self,listOfFields,bz,bp):
+    def del_rho(self,listOfFields,bz,bp):
         rhop,rhon,drhop,drhon = listOfFields
         rho = rhop + rhon
         
@@ -360,7 +296,7 @@ class Skyrme_rho_alpha(BaseSkyrme):
         return self.B7 * self.integrate(rho**(2+self.alpha),bz,bp) + self.B8*\
             self.integrate(rho**self.alpha*(rhop**2 + rhon**2),bz,bp)
             
-    def var_rho(self,listOfFields,bz,bp):
+    def rho(self,listOfFields,bz,bp):
         rhop,rhon = listOfFields
         rho = rhop + rhon
         
@@ -375,29 +311,29 @@ class Skyrme_rho_divJ(BaseSkyrme):
         self.B9 = B9
         self.B9p = B9p
         
-        self.inputs = [['p','rho'],['n','rho'],['p','div_J'],['n','div_J']]
+        self.inputs = [['p','rho'],['n','rho'],['p','divJ'],['n','divJ']]
         
     def get_eneg(self,listOfFields,bz,bp):
         rhop,rhon,divJp,divJn = listOfFields
         return self.B9*self.integrate((rhop+rhon)*(divJp+divJn),bz,bp) + \
             self.B9p*self.integrate(rhop*divJp+rhon*divJn,bz,bp)
             
-    def var_rho(self,listOfFields,bz,bp):
+    def rho(self,listOfFields,bz,bp):
         rhop,rhon,divJp,divJn = listOfFields
         divJ = divJp + divJn
         
         return self.B9*divJ + self.B9p*divJp, self.B9*divJ + self.B9p*divJn
     
-    def var_div_J(self,listOfFields,bz,bp):
+    def divJ(self,listOfFields,bz,bp):
         rhop,rhon,divJp,divJn = listOfFields
         rho = rhop + rhon
         return self.B9*rho + self.B9p*rhop, self.B9*rho + self.B9p*rhon
-        
+
 class CoulombDirect_Gaussian(BaseSkyrme):
-    def __init__(self,*args,nLeg=160,b=50):
+    def __init__(self,*args,nLeg=160,b=50,Iarr=None):
         super().__init__(*args)
         
-        self.e2 = GlobalVariables.e2
+        self.e2 = utils.GlobalVariables.e2
         
         self.nLeg = nLeg
         #Legendre nodes are $\zeta'$ from my notes
@@ -410,168 +346,133 @@ class CoulombDirect_Gaussian(BaseSkyrme):
         self.zeta = self.legNodes
         self.a = 1/self.b * self.zeta/np.sqrt(1-self.zeta**2)
         
-        self._is_cached = False
+        self.Iarr = Iarr
         
         self.inputs = [['p','rho'],]
-        
-    # def _get_field(self,rhop,bz,bp):
-    #     Iarr = np.zeros((self.nLeg//2,)+rhop.shape)
-        
-    #     rVals = np.sqrt(self.eta)*bp
-    #     zVals = self.xi*bz
-        
-    #     #TODO: this loop is slow, and could be sped up considerably with some
-    #     #clever broadcasting
-    #     for (i,a) in enumerate(self.a):
-    #         for (j,r) in enumerate(rVals):
-    #             for (k,z) in enumerate(zVals):
-    #                 dist = (r-rVals[:,None])**2 + (z-zVals[None,:])**2
-    #                 arrToIntegrate = np.exp(-dist * a**2)
-    #                 arrToIntegrate *= special.ive(0,2*r*rVals*a**2)[:,None] * rhop
-    #                 Iarr[i,j,k] = self.integrate(arrToIntegrate,bz,bp)
-        
-    #     arr = Iarr/(1-self.zeta[:,None,None]**2)**(3/2) * self.legWeights[:,None,None]
-    #     arr = arr.sum(axis=0)
-        
-    #     return self.e2/(self.b*np.sqrt(np.pi))*arr
+
+    def get_Iarr(self,bz,bp):
+        if self.Iarr is None:
+            self.bz = bz
+            self.bp = bp
+            self.Iarr = np.zeros(2*(self.eta.size,)+2*(self.xi.size,))
+            
+            rVals = np.sqrt(self.eta)*bp
+            zVals = self.xi*bz
+
+            d = (rVals[:,None,None,None]-rVals[None,:,None,None])**2 \
+                + (zVals[None,None,:,None]-zVals[None,None,None,:])**2
+            for (aIter,a) in enumerate(self.a):
+                toAdd = np.exp(-d * a**2)
+                toAdd *= special.i0e(2*rVals[:,None]*rVals[None,:]*a**2)[:,:,None,None]
+                toAdd *= 1/(1-self.zeta[aIter]**2)**(3/2) * self.legWeights[aIter]
+                self.Iarr += toAdd
+            
+            self.Iarr *= self.e2/(self.b*np.sqrt(np.pi))
+            self.Iarr = np.swapaxes(self.Iarr,1,2)
+
+        #Iarr changes with harmonic oscillator widths.
+        #WARNING: not tested
+        if not hasattr(self,'bz'): self.bz = bz
+        if not hasattr(self,'bp'): self.bp = bp
+
+        if bz != self.bz or bp != self.bp:
+            self.Iarr = None
+            self.Iarr = self._get_Iarr(bz,bp)
+
+        return self.Iarr
     
     def _get_field(self,rhop,bz,bp):
-        Iarr = np.zeros((self.nLeg//2,)+rhop.shape)
-        
-        rVals = np.sqrt(self.eta)*bp
-        zVals = self.xi*bz
-        
-        #This is faster than 3 nested loops, and faster than broadcasting the j loop.
-        #It's also faster than my attempt at jax below.
-        #This may be the fastest possible, given that this is doing 80x40x80 times
-        #as many integrals as any of the other terms
-        # netTime = 0
-        for (j,r) in enumerate(rVals):
-            dist = (r-rVals[None,:,None])**2 + (zVals[:,None,None]-zVals[None,None,:])**2
-            # t0 = time.time()
-            for (i,a) in enumerate(self.a):
-                arrToIntegrate = np.exp(-dist * a**2)
-                arrToIntegrate *= special.i0e(2*r*rVals*a**2)[:,None] * rhop
-                Iarr[i,j] = self.integrate(arrToIntegrate,bz,bp)
-            # t1 = time.time()
-            # netTime += t1 - t0
-        
-        arr = Iarr/(1-self.zeta[:,None,None]**2)**(3/2) * self.legWeights[:,None,None]
-        arr = arr.sum(axis=0)
-        # print('Coulomb direct time',netTime)
-        
-        return self.e2/(self.b*np.sqrt(np.pi))*arr
-    
-    # def _get_field(self,rhop,bz,bp):
-    #     Iarr = np.zeros((self.nLeg//2,)+rhop.shape)
-        
-    #     rVals = np.sqrt(self.eta)*bp
-    #     zVals = self.xi*bz
-        
-    #     rReshaped = rVals[None,None,:,None]
-    #     z1 = zVals[None,:,None,None]
-    #     z2 = zVals[None,None,None,:]
-    #     aVals = self.a[:,None,None,None]
-        
-    #     # netTime = 0
-    #     for (j,r) in enumerate(rVals):
-    #         dist = (r-rReshaped)**2 + (z1-z2)**2
-    #         # t0 = time.time()
-    #         arrToIntegrate = np.exp(-dist*aVals**2)
-    #         arrToIntegrate *= special.i0e(2*r*rReshaped*aVals**2)
-    #         arrToIntegrate *= rhop
-    #         Iarr[:,j] = self.integrate(arrToIntegrate,bz,bp)
-    #         # t1 = time.time()
-    #         # netTime += t1 - t0
-        
-    #     arr = Iarr/(1-self.zeta[:,None,None]**2)**(3/2) * self.legWeights[:,None,None]
-    #     arr = arr.sum(axis=0)
-    #     # print('netTime',netTime)
-        
-    #     return self.e2/(self.b*np.sqrt(np.pi))*arr
-    
-    # def _get_field(self,rhop,bz,bp):
-    #     Iarr = np.zeros((self.nLeg//2,)+rhop.shape)
-        
-    #     rVals = np.sqrt(self.eta)*bp
-    #     zVals = self.xi*bz
-        
-    #     _special_evals = special.i0e(2*rVals[:,None,None]*rVals[None,None,:]*self.a[None,:,None]**2)
-        
-    #     netTime = 0
-    #     for (j,r) in enumerate(rVals):
-    #         dist = (r-rVals[None,:,None])**2 + (zVals[:,None,None]-zVals[None,None,:])**2
-    #         # expEval = np.exp(-dist)
-    #         for (i,a) in enumerate(self.a):
-    #             # t0 = time.time()
-    #             # arrToIntegrate = expEval ** (a**2)
-    #             arrToIntegrate = np.exp(-dist * a**2)
-                
-    #             # t1 = time.time()
-    #             arrToIntegrate *= _special_evals[j,i,:,None] * rhop
-    #             # arrToIntegrate *= special.i0e(2*r*rVals*a**2)[:,None] * rhop
-                
-    #             # netTime += t1 - t0
-    #             Iarr[i,j] = self.integrate(arrToIntegrate,bz,bp)
-        
-    #     arr = Iarr/(1-self.zeta[:,None,None]**2)**(3/2) * self.legWeights[:,None,None]
-    #     arr = arr.sum(axis=0)
-    #     print('netTime',netTime)
-        
-    #     return self.e2/(self.b*np.sqrt(np.pi))*arr
-    
-    # def _get_field(self,rhop,bz,bp):
-    #     rVals = np.sqrt(self.eta)*bp
-    #     zVals = self.xi*bz
-        
-    #     def _elemental(args):
-    #         a, r = args
-    #         dist = (r-rVals[None,:,None])**2 + (zVals[:,None,None]-zVals[None,None,:])**2
-    #         arrToIntegrate = np.exp(-dist * a**2)
-    #         arrToIntegrate *= special.i0e(2*r*rVals*a**2)[:,None] * rhop
-    #         return self.integrate(arrToIntegrate,bz,bp)
-        
-    #     argsArr = np.array(list(itertools.product(self.a,rVals)))
-    #     Iarr = np.apply_along_axis(_elemental,1,argsArr).reshape((self.a.size,)+rhop.shape)
-        
-    #     arr = Iarr/(1-self.zeta[:,None,None]**2)**(3/2) * self.legWeights[:,None,None]
-    #     arr = arr.sum(axis=0)
-        
-    #     return self.e2/(self.b*np.sqrt(np.pi))*arr
-    
-    # @partial(jit,static_argnames=('self',))
-    # def _get_field(self,rhop,bz,bp):
-    #     rVals = jnp.sqrt(self.eta)*bp
-    #     zVals = self.xi*bz
-        
-    #     def _elemental(args):
-    #         r, a = args
-    #         dist = (r-rVals[None,:,None])**2 + (zVals[:,None,None]-zVals[None,None,:])**2
-    #         arrToIntegrate = jnp.exp(-dist * a**2)
-    #         arrToIntegrate *= jax.scipy.special.i0e(2*r*rVals*a**2)[:,None] * rhop
-    #         return self.integrate(arrToIntegrate,bz,bp)
-        
-    #     argsArr = jnp.array(list(itertools.product(rVals,self.a)))
-    #     Iarr = lax.map(_elemental,argsArr)
-    #     Iarr = jnp.moveaxis(Iarr.reshape(rVals.size,self.a.size,zVals.size),1,0)
-        
-    #     arr = Iarr/(1-self.zeta[:,None,None]**2)**(3/2) * self.legWeights[:,None,None]
-    #     arr = arr.sum(axis=0)
-        
-    #     return self.e2/(self.b*jnp.sqrt(jnp.pi))*arr
+        Iarr = self.get_Iarr(bz,bp)
+        return self.integrate(Iarr*rhop,bz,bp)
         
     def get_eneg(self,listOfFields,bz,bp):
         rhop, = listOfFields
         return self.integrate(rhop*self._get_field(rhop,bz,bp),bz,bp)
     
-    def var_rho(self,listOfFields,bz,bp):
+    def rho(self,listOfFields,bz,bp):
         rhop, = listOfFields
         return 2*self._get_field(rhop,bz,bp), np.zeros(rhop.shape)
+    
+class CoulombDirect_Gaussian_Reduced(BaseSkyrme):
+    def __init__(self,rhopPSInv,rhopBasis,*args,nLeg=160,b=50,Iarr=None):
+        super().__init__(*args)
+
+        self.rhopPSInv = rhopPSInv
+        self.rhopBasis = rhopBasis
+        
+        self.e2 = utils.GlobalVariables.e2
+        
+        self.nLeg = nLeg
+        #Legendre nodes are $\zeta'$ from my notes
+        legNodes, legWeights = np.polynomial.legendre.leggauss(self.nLeg)
+        #Want only nodes and weights in interval [0,1], to match HFBTHO
+        self.legNodes = legNodes[nLeg//2:]
+        self.legWeights = legWeights[nLeg//2:]
+        self.b = b
+        
+        self.zeta = self.legNodes
+        self.a = 1/self.b * self.zeta/np.sqrt(1-self.zeta**2)
+        
+        self.Iarr = Iarr
+        
+        self.inputs = [['p','rho'],]
+
+    def get_Iarr(self,bz,bp):
+        if self.Iarr is None:
+            self.bz = bz
+            self.bp = bp
+            self.Iarr = np.zeros(2*(self.eta.size,)+2*(self.xi.size,))
+            
+            rVals = np.sqrt(self.eta)*bp
+            zVals = self.xi*bz
+
+            d = (rVals[:,None,None,None]-rVals[None,:,None,None])**2 \
+                + (zVals[None,None,:,None]-zVals[None,None,None,:])**2
+            for (aIter,a) in enumerate(self.a):
+                toAdd = np.exp(-d * a**2)
+                toAdd *= special.i0e(2*rVals[:,None]*rVals[None,:]*a**2)[:,:,None,None]
+                toAdd *= 1/(1-self.zeta[aIter]**2)**(3/2) * self.legWeights[aIter]
+                self.Iarr += toAdd
+            
+            self.Iarr *= self.e2/(self.b*np.sqrt(np.pi))
+            self.Iarr = np.swapaxes(self.Iarr,1,2)
+
+        #Iarr changes with harmonic oscillator widths.
+        #WARNING: not tested
+        if not hasattr(self,'bz'): self.bz = bz
+        if not hasattr(self,'bp'): self.bp = bp
+
+        if bz != self.bz or bp != self.bp:
+            self.Iarr = None
+            self.Iarr = self._get_Iarr(bz,bp)
+
+        return self.Iarr
+    
+    def _get_field(self,rhop,bz,bp):
+        Iarr = self.get_Iarr(bz,bp)
+
+        try:
+            coeffs = self.rhopPSInv @ rhop[0]
+            rhop = coeffs @ np.swapaxes(self.rhopBasis,0,1)
+        except ValueError:
+            pass
+
+        return self.integrate(Iarr*rhop,bz,bp)
+        
+    def get_eneg(self,listOfFields,bz,bp):
+        rhop, = listOfFields
+        return self.integrate(rhop*self._get_field(rhop,bz,bp),bz,bp)
+    
+    def rho(self,listOfFields,bz,bp):
+        rhop, = listOfFields
+        fieldOut = 2*self._get_field(rhop,bz,bp)
+        return fieldOut, np.zeros(fieldOut.shape)
     
 class CoulombDirect_Laplace(BaseSkyrme):
     #TODO: factors of 2 floating about that need to be fixed
     def __init__(self,*args):
         super().__init__(*args)
+        warnings.warn('Stop using this - CoulombDirect_Gaussian is now fast!')
         
         self.inputs = [['p','rho'],['p','del_rho']]
         
@@ -588,22 +489,64 @@ class CoulombDirect_Laplace(BaseSkyrme):
             ellipticEval = special.ellipe(ellipticArg)
             
             ret[j] = self.integrate(delRho*np.sqrt(d)*ellipticEval,bz,bp)
-        return 2*GlobalVariables.e2*ret/(2*np.pi)
+        return 2*utils.GlobalVariables.e2*ret/(2*np.pi)
     
     def get_eneg(self,listOfFields,bz,bp):
         rhop, delRhop = listOfFields
         return self.integrate(rhop*self._get_field(delRhop,bz,bp),bz,bp)/2
         
-    def var_rho(self,listOfFields,bz,bp):
+    def rho(self,listOfFields,bz,bp):
         rhop, delRhop = listOfFields
         
         return self._get_field(delRhop,bz,bp), np.zeros(delRhop.shape)
+    
+class Approximate_CoulombDirect(BaseSkyrme):
+    def __init__(self,coordInds,*args,shp=(40,80)):
+        raise NotImplementedError('Needs to be made consistent with CoulombDirect_Gaussian')
+        self.coordInds = coordInds
+        super().__init__(*args)
+        
+        self.inputs = [['p','rho'],['p','del_rho']]
+        self.shp = shp
+        
+    def _get_field(self,delRho,bz,bp):
+        ret = np.zeros(delRho.shape)
+        
+        rVals = np.sqrt(self.eta)*bp
+        zVals = self.xi*bz
+        
+        for (j,r) in enumerate(rVals):
+            d = (r+rVals[None,:,None])**2 + (zVals[:,None,None]-zVals[None,None,:])**2
+            
+            ellipticArg = 4*r*rVals[None,:,None]/d
+            ellipticEval = special.ellipe(ellipticArg)
+            
+            ret[j] = self.integrate(delRho*np.sqrt(d)*ellipticEval,bz,bp)
+            
+        del d #May or may not help
+        return 2*utils.GlobalVariables.e2*ret/(2*np.pi)
+    
+    def get_eneg(self,listOfFields,bz,bp):
+        raise NotImplementedError
+    
+    def rho(self,listOfFields,bz,bp):
+        rhop, delRhop = listOfFields
+        
+        fullDelRhop = np.zeros(self.shp)
+        fullDelRhop[self.coordInds] = delRhop
+        
+        field = self._get_field(fullDelRhop,bz,bp)
+        
+        # print(field.shape)
+        # hfb.plot_field(field,eta,xi)
+        # sys.exit()
+        return field, np.zeros(delRhop.shape)
     
 class CoulombExchange(BaseSkyrme):
     def __init__(self,*args):
         super().__init__(*args)
         
-        e2 = GlobalVariables.e2
+        e2 = utils.GlobalVariables.e2
         self.coeff = -3/4*e2*(3/np.pi)**(1/3)
         
         self.inputs = [['p','rho'],]
@@ -612,7 +555,7 @@ class CoulombExchange(BaseSkyrme):
         rhop, = listOfFields
         return self.coeff * self.integrate(rhop**(4/3),bz,bp)
     
-    def var_rho(self,listOfFields,bz,bp):
+    def rho(self,listOfFields,bz,bp):
         rhop, = listOfFields
         return self.coeff*4/3*rhop**(1/3), np.zeros(rhop.shape)
 
@@ -638,7 +581,7 @@ class Pairing_delta(BaseSkyrme):
         if g != 1:
             raise NotImplementedError
             
-        self.inputs = [['p','rho'],['n','rho'],['p','kappa'],['n','kappa']]
+        self.inputs = [['p','rho'],['n','rho'],['p','rho_tilde'],['n','rho_tilde']]
         
     def get_eneg(self,listOfFields,bz,bp):
         rhop,rhon,rhopPair,rhonPair = listOfFields
@@ -652,7 +595,7 @@ class Pairing_delta(BaseSkyrme):
         
         return self.integrate(arrp+arrn,bz,bp)
     
-    def var_rho(self,listOfFields,bz,bp):
+    def rho(self,listOfFields,bz,bp):
         rhop,rhon,rhopPair,rhonPair = listOfFields
         
         common = -1/self.rhoc*(rhopPair**2 + rhonPair**2)
@@ -660,7 +603,7 @@ class Pairing_delta(BaseSkyrme):
         #Below agrees worse with HFBTHO's results
         # return -self.V0[0]*self.V1[0]/self.rhoc*rhopPair**2, -self.V0[1]*self.V1[1]/self.rhoc*rhonPair**2
     
-    def var_rho_tilde(self,listOfFields,bz,bp):
+    def rho_tilde(self,listOfFields,bz,bp):
         rhop,rhon,rhopPair,rhonPair = listOfFields
         
         common = (rhop+rhon)/self.rhoc
@@ -670,6 +613,69 @@ class Pairing_delta(BaseSkyrme):
             self.V0[1]*(1-self.V1[1]*common) * rhonPair
         # return 2*self.V0[0]*(1-self.V1[0]*common) * rhopPair, \
         #     2*self.V0[1]*(1-self.V1[1]*common) * rhonPair
+    
+class SkyrmeEDF:
+    def __init__(self,edfParams,xi,eta,wz,wr,directCoulombObj):
+        Mv = 1.24983857423226952
+        rhocPair = 0.16
+
+        g, C00pp, C0Dpp, C0pt, C1pt, C10pp, C1Dpp = \
+            misc_phys.EDFParams.inm_to_isospin(edfParams['rho0'],
+                                               edfParams['Ms_inv'],
+                                               Mv,
+                                               edfParams['K'],
+                                               edfParams['EoA'],
+                                               edfParams['a'],
+                                               edfParams['L'])
+
+        B = misc_phys.EDFParams.isospin_to_pn(C00pp,C10pp,C0pt,C1pt,edfParams['Crdr0'],edfParams['Crdr1'],C0Dpp,C1Dpp,
+                                              edfParams['CrdJ0'],edfParams['CrdJ1'])
+
+        #Pairing parameters (proton, neutron)
+        V0 = [edfParams['Vp'],edfParams['Vn']]
+        V1 = [0.5,0.5]
+        sigma = 1
+        
+        self.terms = {'kinetic':Skyrme_Kinetic(xi,eta,wz,wr),
+                      'rho_rho':Skyrme_rho_rho(B[0],B[1],xi,eta,wz,wr),
+                      'rho_tau':Skyrme_rho_tau(B[2],B[3],xi,eta,wz,wr),
+                      'rho_dRho':Skyrme_rho_dRho(B[4],B[5],xi,eta,wz,wr),
+                      'rho_alpha':Skyrme_rho_alpha(B[6],B[7],g,xi,eta,wz,wr),
+                      'coulomb_exchange':CoulombExchange(xi,eta,wz,wr),
+                      'coulomb_direct':directCoulombObj,
+                      'rho_divJ':Skyrme_rho_divJ(B[8],B[9],xi,eta,wz,wr),
+                      'pairing_delta':Pairing_delta(V0,V1,sigma,rhocPair,xi,eta,wz,wr)
+                      }
+        
+        #EDF arguments
+        self.integArgs = {key:getattr(term,'inputs') for (key,term) in self.terms.items()}
+
+    def hfb_energy_wrapper(self,densities,bz,bp,display=False):
+        eneg = {}
+        
+        for (key,term) in self.terms.items():
+            if display:
+                print(term.__class__)
+            t0 = time.time()
+            integArgs = [densities[tup[0]][tup[1]] for tup in self.integArgs[key]]
+            eneg[key] = term.get_eneg(integArgs,bz,bp)
+            t1 = time.time()
+            if display:
+                print(eneg[key],t1-t0)
+            
+        totalEneg = 0.
+        for val in eneg.values():
+            totalEneg += val
+
+        eneg['volume'] = eneg['rho_rho'] + eneg['rho_tau'] + eneg['rho_alpha']
+        eneg['surface'] = eneg['rho_dRho']
+        eneg['coulomb'] = eneg['coulomb_direct'] + eneg['coulomb_exchange']
+        eneg['spin-orbit'] = eneg['rho_divJ']
+        eneg['pairing'] = eneg['pairing_delta']
+        eneg['net'] = eneg['kinetic'] + eneg['volume'] + eneg['surface'] + eneg['coulomb'] + \
+            eneg['spin-orbit'] + eneg['pairing']
+                
+        return eneg
             
 def ho_weights_and_nodes(nr=40,nz=80):
     #TODO: should be made part of HarmonicOscillatorBasis
@@ -703,6 +709,9 @@ class HarmonicOscillatorBasis:
         
         self.betap = 1/bp
         self.betaz = 1/bz
+
+        self.bp = bp
+        self.bz = bz
         
     def sp_eneg(self,nr,nz,lamd,spin):
         return (2*nr + lamd + 1)*self.hoPerp + (nz+0.5)*self.hoZ
@@ -752,6 +761,9 @@ class HarmonicOscillatorBasis:
         
         eta = r**2*self.betap**2
         xi = z*self.betaz
+
+        self.nr = len(r)
+        self.nz = len(z)
         
         """
         -----------------------------------------------------------------------
@@ -955,7 +967,7 @@ class HFBMatrix(CylindricalIntegral):
                 blockArrInds.append(idx - q.index[0])
             self.arrInds.append(blockArrInds)
         
-    def var_rho(self,varRho,bz,bp):
+    def rho(self,varRho,bz,bp):
         blockMats = []
         
         if varRho.ndim == 2:
@@ -967,21 +979,24 @@ class HFBMatrix(CylindricalIntegral):
             shp = 2*(len(self.basis.quantNumbersByBlock[k]),)
             mat = np.zeros((nEls,)+shp)
             
+            #Reduces runtime by about 0.1 s
+            # psiVarRho = self.basis.psi[k]*varRho
+            # for mlInds in self.arrInds[k]:
+            #     for (i1Iter,i1) in enumerate(mlInds):
+            #         for i2Iter in range(i1Iter+1):
+            #             i2 = mlInds[i2Iter]
+                        
+            #             toIntegrate = psiVarRho[i1]*self.basis.psi[k][i2]
+            #             mat[:,i1,i2] = self.integrate(toIntegrate,bz,bp)/(2*np.pi)
             for mlInds in self.arrInds[k]:
                 for (i1Iter,i1) in enumerate(mlInds):
                     for i2Iter in range(i1Iter+1):
                         i2 = mlInds[i2Iter]
-                        #Simple things, like pre-allocating wf1 and wf2, don't
-                        #speed this step up. Precomputing them will help,
-                        #but I can handle that later, once I know exactly what
-                        #needs to be precomputed
                         
-                        #The variance in the run time here is about 0.1 s,
-                        #so speedups on that order-of-magnitude are irrelevant
-                        toIntegrate = self.basis.psi[k][i1]*self.basis.psi[k][i2]*varRho
+                        toIntegrate = self.basis.psi[k][i1]*varRho*self.basis.psi[k][i2]
                         mat[:,i1,i2] = self.integrate(toIntegrate,bz,bp)/(2*np.pi)
                     
-            mat = symmetrize_array(mat)
+            mat = utils.symmetrize_array(mat)
             if nEls == 1:
                 blockMats.append(mat[0])
             else:
@@ -989,10 +1004,13 @@ class HFBMatrix(CylindricalIntegral):
             
         return blockMats
     
+    def rho_tilde(self,varRhoTilde,bz,bp):
+        return self.rho(varRhoTilde,bz,bp)
+    
     # # @profile
     # #The profiler thinks this version is faster, but actually running it,
     # #it turns out to be slower
-    # def var_rho(self,varRho,bz,bp):
+    # def rho(self,varRho,bz,bp):
     #     blockMats = []
         
     #     for k in range(self.basis.nBlocks):
@@ -1008,7 +1026,7 @@ class HFBMatrix(CylindricalIntegral):
             
     #     return blockMats
     
-    def var_lapl_rho(self,varLaplRho,bz,bp):
+    def del_rho(self,varLaplRho,bz,bp):
         blockMats = []
         
         r = bp*np.sqrt(self.eta)[:,None]
@@ -1029,6 +1047,24 @@ class HFBMatrix(CylindricalIntegral):
             #Saves some fraction of the runtime
             dpsiOverR = dpsi[0]/r
             
+            #Reduces runtime by about 0.1 s
+            # psiVarLaplRho = psi*varLaplRho
+            # dpsiVarLaplRho = dpsi*varLaplRho
+            # for mlInds in self.arrInds[k]:
+            #     for (i1Iter,i1) in enumerate(mlInds):
+            #         for i2Iter in range(i1Iter+1):
+            #             i2 = mlInds[i2Iter]
+                        
+            #             #The radial derivative
+            #             term1 = psiVarLaplRho[i1]*d2psi[0,i2] 
+            #             term1 += 2*dpsiVarLaplRho[0,i1]*dpsi[0,i2] 
+            #             term1 += d2psi[0,i1]*psiVarLaplRho[i2]
+            #             term1 += psiVarLaplRho[i1]*dpsiOverR[i2] + dpsiOverR[i1]*psiVarLaplRho[i2]
+                        
+            #             #The z derivative
+            #             term2 = psiVarLaplRho[i1]*d2psi[5,i2] + 2*dpsiVarLaplRho[2,i1]*dpsi[2,i2] + d2psi[5,i1]*psiVarLaplRho[i2]
+                        
+            #             mat[:,i1,i2] = self.integrate(term1+term2,bz,bp)/(2*np.pi)
             for mlInds in self.arrInds[k]:
                 for (i1Iter,i1) in enumerate(mlInds):
                     for i2Iter in range(i1Iter+1):
@@ -1045,7 +1081,7 @@ class HFBMatrix(CylindricalIntegral):
                         
                         mat[:,i1,i2] = self.integrate(varLaplRho*(term1+term2),bz,bp)/(2*np.pi)
             
-            mat = symmetrize_array(mat)
+            mat = utils.symmetrize_array(mat)
             if nEls == 1:
                 blockMats.append(mat[0])
             else:
@@ -1054,7 +1090,7 @@ class HFBMatrix(CylindricalIntegral):
         return blockMats
     
     # This is actually even slower than what we already have
-    # def var_lapl_rho(self,varLaplRho,bz,bp):
+    # def lapl_rho(self,varLaplRho,bz,bp):
     #     blockMats = []
         
     #     r = bp*np.sqrt(self.eta)
@@ -1093,7 +1129,7 @@ class HFBMatrix(CylindricalIntegral):
     
     
     # ## The method below is actually half as fast as the normally-used version
-    # def var_lapl_rho(self,varLaplRho,bz,bp):
+    # def lapl_rho(self,varLaplRho,bz,bp):
     #     blockMats = []
         
     #     r = bp*np.sqrt(self.eta)
@@ -1143,7 +1179,7 @@ class HFBMatrix(CylindricalIntegral):
             
     #     return blockMats
     
-    def var_tau(self,varTau,bz,bp):
+    def tau(self,varTau,bz,bp):
         blockMats = []
         
         r = bp*np.sqrt(self.eta)
@@ -1178,7 +1214,7 @@ class HFBMatrix(CylindricalIntegral):
                         term3 = lambd**2/r[:,None]**2 * psi[i1]*psi[i2]
                         
                         mat[:,i1,i2] = self.integrate(varTau*(term1+term2+term3),bz,bp)/(2*np.pi)
-            mat = symmetrize_array(mat)
+            mat = utils.symmetrize_array(mat)
             if nEls == 1:
                 blockMats.append(mat[0])
             else:
@@ -1186,7 +1222,7 @@ class HFBMatrix(CylindricalIntegral):
             
         return blockMats
     
-    def var_divJ(self,varDivJ,bz,bp):
+    def divJ(self,varDivJ,bz,bp):
         blockMats = []
         
         if varDivJ.ndim == 2:
@@ -1214,7 +1250,7 @@ class HFBMatrix(CylindricalIntegral):
                     arr = Mr[i1,i2]*term1 + Mphi[i1,i2] * term2 + Mz[i1,i2]*term3
                     
                     mat[:,i1,i2] = self.integrate(varDivJ*arr,bz,bp)/(2*np.pi)
-            mat = symmetrize_array(mat)
+            mat = utils.symmetrize_array(mat)
             if nEls == 1:
                 blockMats.append(mat[0])
             else:
@@ -1228,7 +1264,7 @@ class HFBMatrix(CylindricalIntegral):
     while this does save time (about 5 s of the 11 s runtime), it uses multiple
     CPU cores, so the comparison is faulty
     """
-    # def var_divJ(self,varDivJ,bz,bp):
+    # def divJ(self,varDivJ,bz,bp):
     #     blockMats = []
         
     #     r = bp*np.sqrt(self.eta)
@@ -1417,26 +1453,29 @@ class PairingRegularization:
         self.basis = basis
         self.ebarMax = ebarMax
         self.cutoffTol = cutoffTol
+        self.asDict = [{key:df[key].to_numpy().copy() for key in df.columns} for df in self.basis.quantNumbersByBlock]
 
-    @np.errstate(invalid='ignore')
+    @np.errstate(under='ignore')
     #Some warning occurs in np.sqrt, but it doesn't always happen, and
     #the result is still correct
+    # @profile
     def get_active_states(self,Vin,eqpIn,chemPot):
         #About 4x faster than Pandas operations - from 0.03 s to 0.007 s.
         #Profiler makes it look worse than it actually is, but it's still not
         #great
-        asDict = [{key:df[key].to_numpy() for key in df.columns} for df in self.basis.quantNumbersByBlock]
+        
         ret = []
         
         for k in range(self.basis.nBlocks):
-            asDict[k]['eqp'] = eqpIn[k]
+            self.asDict[k]['eqp'] = eqpIn[k]
             V = Vin[k]
-            asDict[k]['occ'] = np.einsum('ij,ij->j',V,V)
+            # asDict[k]['occ'] = np.einsum('ij,ij->j',V,V).clip(0,1)
+            self.asDict[k]['occ'] = np.sum(V**2,axis=0).clip(0,1)
             
-            asDict[k]['ebar'] = (1-2*asDict[k]['occ'])*asDict[k]['eqp'] + chemPot
-            asDict[k]['del'] = 2*asDict[k]['eqp']*np.sqrt(asDict[k]['occ']*(1-asDict[k]['occ']))
+            self.asDict[k]['ebar'] = (1-2*self.asDict[k]['occ'])*self.asDict[k]['eqp'] + chemPot
+            self.asDict[k]['del'] = 2*self.asDict[k]['eqp']*np.sqrt(self.asDict[k]['occ']*(1-self.asDict[k]['occ']))
             
-            asDict[k]['isActive'] = (asDict[k]['ebar'] <= self.ebarMax)
+            self.asDict[k]['isActive'] = (self.asDict[k]['ebar'] <= self.ebarMax)
             
             #Basically, checking if we're close to the energy cutoff (I don't understand
             #where this comes from, though)
@@ -1445,24 +1484,23 @@ class PairingRegularization:
             #https://stackoverflow.com/a/3477332 which is equivalent to Fortran's HUGE
             maxVal = sys.float_info.max
             
-            exponent = maxVal * np.ones(len(asDict[k]['eqp']))
-            borderInds = np.where(100*np.abs(asDict[k]['ebar'] - self.ebarMax) < np.log(maxVal))[0]
-            exponent[borderInds] = np.exp(100*(asDict[k]['ebar'][borderInds] - self.ebarMax))
-            asDict[k]['exponent'] = exponent
+            exponent = maxVal * np.ones(len(self.asDict[k]['eqp']))
+            borderInds = np.where(100*np.abs(self.asDict[k]['ebar'] - self.ebarMax) < np.log(maxVal))[0]
+            exponent[borderInds] = np.exp(100*(self.asDict[k]['ebar'][borderInds] - self.ebarMax))
+            self.asDict[k]['exponent'] = exponent
+            goodInds = (1/(1+self.asDict[k]['exponent']) > self.cutoffTol)
+            self.asDict[k]['isActive'][goodInds] = True
             
-            goodInds = (1/(1+asDict[k]['exponent']) > self.cutoffTol)
-            asDict[k]['isActive'][goodInds] = True
-            
-            ret.append(pd.DataFrame(asDict[k]))
+            ret.append(self.asDict[k])
             
         return ret
     
+    # @profile
     def adjust_fermi_energy(self,activeStates,N,chemPot):
         #This version is 30-40 times faster than the Pandas version, dropping
         #the runtime for the pairing regularization from 0.16 s to 0.02 s
-        activeStatesDfs = [activeStates[k][activeStates[k]['isActive']] for k in range(self.basis.nBlocks)]
-        ebarList = [a['ebar'].to_numpy() for a in activeStatesDfs]
-        delList = [a['del'].to_numpy() for a in activeStatesDfs]
+        ebarList = [activeStates[k]['ebar'][activeStates[k]['isActive']] for k in range(self.basis.nBlocks)]
+        delList = [activeStates[k]['del'][activeStates[k]['isActive']] for k in range(self.basis.nBlocks)]
         
         def bcs_occ(lambd):
             occ = 0
@@ -1471,6 +1509,7 @@ class PairingRegularization:
                 bcsOcc = 0.5*(1 - diff/np.sqrt(diff**2 + delList[k]**2))
                 
                 occ += bcsOcc.sum()
+            
             return 2*occ - N
         
         def bcs_occ_derivative(lambd):
@@ -1483,10 +1522,81 @@ class PairingRegularization:
             return 2*ret
         
         sol = optimize.root_scalar(bcs_occ,x0=chemPot,fprime=bcs_occ_derivative,method='newton')
-        return sol.root
+        if sol.converged:
+            ret = sol.root
+        else:
+            ret = chemPot
+
+        return ret
+    
+class PSDerivatives:
+    def __init__(self,nEta=40,nXi=80):
+        self.nEta = nEta
+        self.nXi = nXi
+
+        self.eta, self.wr = special.roots_laguerre(nEta)
+        self.xi, self.wz = special.roots_hermite(nXi)
+
+        self.Deta = self.make_D_eta()
+        self.Dxi = self.make_D_xi()
+
+    def psi(self,xi,nz):
+        N = np.sqrt(1/(np.sqrt(np.pi) * 2.**nz * math.factorial(nz)))
+            
+        ret = np.exp(-xi**2/2) * special.eval_hermite(nz,xi)
+            
+        return N * ret
+
+    def phi(self,eta,nr):
+        ret = np.exp(-eta/2)
+        ret = ret*special.eval_genlaguerre(nr,0,eta)
+        return ret
+    
+    def make_D_eta(self):
+        M = np.zeros((self.nEta,self.nEta))
+        for l in range(self.nEta):
+            M[l,l] = -0.5
+            for n in range(self.nEta):
+                if l <= n-1:
+                    M[l,n] -= 1
+
+        #Indexed as phiEvals[j,n]
+        phiEvals = self.phi(self.eta[:,None],np.arange(self.nEta,dtype=int)[None,:])
+        weights = self.wr*np.exp(self.eta/2)
+        #Indexed as lagEval[m,i]
+        lagEval = special.eval_genlaguerre(np.arange(self.nEta,dtype=int)[:,None],0,self.eta[None,:])
+
+        D = weights*(phiEvals @ M @ lagEval)
+        return D
+
+    def make_D_xi(self):
+        #psiEvals is indexed as psiEvals[j,n], i.e. the row (first)
+        #index is the evaluation location, and the column (second)
+        #index is the order of the polynomial
+        psiEvals = np.zeros((self.nXi,self.nXi+1))
+        psiEvals[:,:-1] = np.array([self.psi(self.xi,n) for n in range(self.nXi)]).T
+
+        C = np.sum(psiEvals**2,axis=1)
+
+        M = np.zeros((self.nXi,self.nXi))
+
+        for n in range(self.nXi):
+            M[n] = 1/np.sqrt(2)*(-np.sqrt(n)*psiEvals[:,n-1]\
+                                +np.sqrt(n+1)*psiEvals[:,n+1])
+            M[n] /= C
+
+        D = (M.T @ psiEvals[:,:-1].T).T
+        return D
+
+    def laplacian(self,arr,bz,bp):
+        ret = self.Deta @ arr + self.eta[:,None] * (self.Deta @ self.Deta @ arr)
+        ret = 4/bp**2 * ret
+
+        ret += 1/bz**2 * (self.Dxi @ self.Dxi @ arr.T).T
+        return ret
     
 class Reconstruction:
-    def __init__(self,basis,rGrid):
+    def __init__(self,basis,rGrid,laplaceMode='exact',laplaceOpts={}):
         self.basis = basis
         self.rGrid = rGrid
         
@@ -1494,10 +1604,16 @@ class Reconstruction:
         self.dVgrid = 3*[None,]
         self.d2Vgrid = 6*[None,]
         self.Ugrid = None
+
+        assert laplaceMode in ['exact','pseudospectral']
+        self.laplaceMode = laplaceMode
         
         self.activeList, self.upList, self.downList = None, None, None
-        
-        
+
+        self.densities = {}
+        if laplaceMode == 'pseudospectral':
+            self.derivativeObj = laplaceOpts['derivativeObj']
+                
     def compute_V(self,activeStates,U,V,coordInds=None):
         self._get_spin_ud_inds(activeStates)
         
@@ -1528,6 +1644,8 @@ class Reconstruction:
                     # c = a @ b
                     # d = np.swapaxes(c,0,1)
                     # Vgrid[ud].append(d)
+                    # print(V[k][idx].shape)
+                    # print(self.basis.psi[k][*wfInds].shape)
                     self.Vgrid[ud].append(
                         np.swapaxes(
                             V[k][idx].T @ np.swapaxes(self.basis.psi[k][*wfInds],0,1),0,1))
@@ -1561,7 +1679,8 @@ class Reconstruction:
                             np.swapaxes(V[k][idx].T @ np.swapaxes(
                                 self.basis.dpsi[k][derivativeIdx][*wfInds],0,1),0,1))
         return
-    # @timer
+    
+    # @profile
     def compute_d2V(self,activeStates,U,V,idxToCompute=[0,5],coordInds=None):
         self._get_spin_ud_inds(activeStates)
         
@@ -1632,7 +1751,8 @@ class Reconstruction:
                 
                 self.activeList.append(activeInds)
                 
-                subDf = activeStates[k]
+                # subDf = activeStates[k]
+                subDf = self.basis.quantNumbersByBlock[k]
                 self.upList.append(np.where(subDf['2m_s']==1)[0])
                 self.downList.append(np.where(subDf['2m_s']==-1)[0])
         return 
@@ -1651,29 +1771,74 @@ class Reconstruction:
         #Multiply by 2 for time-reversed states, divide by 2 pi for $\phi$ coordinate
         #integral
         rho = 2 * rho / (2*np.pi)
-            
+        
+        self.densities['rho'] = rho
         return rho
-    # @timer
-    def lapl_rho(self,activeStates,U,V,coordInds=None):
+    
+    def dr_rho(self,activeStates,U,V,coordInds=None):
         self.compute_V(activeStates,U,V,coordInds=coordInds)
-        self.compute_dV(activeStates,U,V,idxToCompute=[0,1,2],coordInds=coordInds)
-        self.compute_d2V(activeStates,U,V,idxToCompute=[0,5],coordInds=coordInds)
-        
+        self.compute_dV(activeStates,U,V,idxToCompute=[0,],coordInds=coordInds)
+
         shp = self.Vgrid['up'][0].shape[1:]
-        
-        delRho = np.zeros(shp)
+            
+        dr_rho = np.zeros(shp)
         
         for ud in ['up','down']:
             for k in range(len(self.Vgrid[ud])):
-                delRho += 2*np.sum(self.Vgrid[ud][k]*(self.d2Vgrid[0][ud][k] + self.d2Vgrid[5][ud][k]) \
-                                   + self.dVgrid[0][ud][k]**2 + self.dVgrid[2][ud][k]**2 \
-                                   + self.Vgrid[ud][k]*self.dVgrid[0][ud][k]/self.rGrid,
+                dr_rho += 2*np.sum(self.Vgrid[ud][k]*self.dVgrid[0][ud][k],
                                    axis=0)
         
         #Multiply by 2 for time-reversed states, divide by 2 pi for $\phi$ coordinate
         #integral
-        delRho = 2 * delRho / (2*np.pi)
+        dr_rho = 2 * dr_rho / (2*np.pi)
+
+        return dr_rho
+    
+    def dz_rho(self,activeStates,U,V,coordInds=None):
+        self.compute_V(activeStates,U,V,coordInds=coordInds)
+        self.compute_dV(activeStates,U,V,idxToCompute=[2,],coordInds=coordInds)
+
+        shp = self.Vgrid['up'][0].shape[1:]
+            
+        dz_rho = np.zeros(shp)
         
+        for ud in ['up','down']:
+            for k in range(len(self.Vgrid[ud])):
+                dz_rho += 2*np.sum(self.Vgrid[ud][k]*self.dVgrid[2][ud][k],
+                                   axis=0)
+        
+        #Multiply by 2 for time-reversed states, divide by 2 pi for $\phi$ coordinate
+        #integral
+        dz_rho = 2 * dz_rho / (2*np.pi)
+
+        return dz_rho
+
+    # @timer
+    def del_rho(self,activeStates,U,V,coordInds=None):
+        if self.laplaceMode == 'exact':
+            self.compute_V(activeStates,U,V,coordInds=coordInds)
+            self.compute_dV(activeStates,U,V,idxToCompute=[0,1,2],coordInds=coordInds)
+            self.compute_d2V(activeStates,U,V,idxToCompute=[0,5],coordInds=coordInds)
+            
+            shp = self.Vgrid['up'][0].shape[1:]
+            
+            delRho = np.zeros(shp)
+            
+            for ud in ['up','down']:
+                for k in range(len(self.Vgrid[ud])):
+                    delRho += 2*np.sum(self.Vgrid[ud][k]*(self.d2Vgrid[0][ud][k] + self.d2Vgrid[5][ud][k]) \
+                                    + self.dVgrid[0][ud][k]**2 + self.dVgrid[2][ud][k]**2 \
+                                    + self.Vgrid[ud][k]*self.dVgrid[0][ud][k]/self.rGrid,
+                                    axis=0)
+            
+            #Multiply by 2 for time-reversed states, divide by 2 pi for $\phi$ coordinate
+            #integral
+            delRho = 2 * delRho / (2*np.pi)
+        elif self.laplaceMode == 'pseudospectral':
+            if coordInds is not None:
+                raise NotImplementedError
+            delRho = self.derivativeObj.laplacian(self.densities['rho'],self.basis.bz,self.basis.bp)
+
         return delRho
     # @timer
     def tau(self,activeStates,U,V,coordInds=None):
@@ -1840,31 +2005,72 @@ class AuxiliaryFieldConstraint:
             qrpaMat.append(1/(eqp + eqp[:,None]))
             
         return qrpaMat
-        
-def eigenvec_to_configuration_space(U,V,basis,activeStates):
-    Vup = []
-    Vdown = []
     
-    Uup = []
-    Udown = []
-    for k in range(basis.nBlocks):
-        activeInds = np.arange(len(activeStates[k]))
-        activeInds = np.where(activeStates[k]['isActive'])[0]
-        if activeInds.size == 0:
-            continue
+class LipkinNogami:
+    """
+    All told, the two routines get_Geff and get_lmd2 take
+    about 0.09 s to run. Could probably be faster,
+    but totally negligible compared to existing bottlenecks
+    """
+    def __init__(self,basis):
+        self.basis = basis
+    
+    # @timer
+    def get_Geff(self,activeStates,U,V,hTilde):
+        #My Geff
+        Epair = 0
+        DeltaBar = 0
+        trRho = 0
+
+        rhoQP = []
+        for k in range(self.basis.nBlocks):
+            activeInds = np.where(activeStates[k]['isActive'])[0]
+            if len(activeInds) == 0:
+                rhoQP.append(np.zeros(2*(len(activeStates[k]['isActive']),)))
+                continue
+            
+            rho = V[k][:,activeInds] @ V[k][:,activeInds].T
+            kappa = V[k][:,activeInds] @ U[k][:,activeInds].T
+
+            rhoQP.append(rho)
+            
+            Epair += -0.5*np.trace(hTilde[k] @ kappa)
+            DeltaBar += np.trace(hTilde[k] @ rho)
+            trRho += np.trace(rho)
+        Epair = 2*Epair #Including time-reversed states
+        #I think time-reversed factors of 2 cancel in DeltaBar
+        DeltaBar /= trRho
+
+        #Signs float about
+        # DeltaBar = -DeltaBar
+        return DeltaBar**2/Epair, rhoQP
+    
+    # @timer
+    def get_lmd2(self,Geff,rhoQP):
+        # Assumes BCS occupations
+        sum1 = 0
+        sum2 = 0
+        sum3 = 0
+        sum4 = 0
+        for k in range(len(rhoQP)):
+            rho = rhoQP[k]
+            # print(np.diag(rho))
+            # sys.exit()
+            
+            v2, _ = np.linalg.eigh(rho)
+            # print(v2 - np.diag(rho)[::-1])
+            # fig, ax = plt.subplots()
+            # ax.plot(v2)
+            # ax.plot(np.diag(rho[::-1]))
+            # plt.show()
+            # sys.exit()
+            v2 = v2.clip(0) #Floating point error drops this below 0 sometimes
+            v = np.sqrt(v2)
+            u = np.sqrt(1-v2)
+
+            sum1 += np.sum(u * v**3)
+            sum2 += np.sum(u**3 * v)
+            sum3 += np.sum((u*v)**4)
+            sum4 += np.sum((u*v)**2)
+        return -Geff/4*(sum1*sum2 - sum3)/(sum4**2 - sum3)
         
-        #Column Varr[:,i] corresponds to eigenvalue[i]. Since some states aren't active,
-        #we want Varr[:,activeInds]. But, for the spin up/down component, we only want
-        #Varr[spinUpInds,:]. So, we index as Varr[spin,activeInds], with appropriate
-        #broadcasting b/c numpy
-        subDf = activeStates[k]
-        spinUp = np.where(subDf['2m_s']==1)[0]
-        spinDown = np.where(subDf['2m_s']==-1)[0]
-        
-        Vup.append(V[k][spinUp[:,None],activeInds[None,:]])
-        Vdown.append(V[k][spinDown[:,None],activeInds[None,:]])
-        
-        Uup.append(U[k][spinUp[:,None],activeInds[None,:]])
-        Udown.append(U[k][spinDown[:,None],activeInds[None,:]])
-        
-    return Uup, Udown, Vup, Vdown
