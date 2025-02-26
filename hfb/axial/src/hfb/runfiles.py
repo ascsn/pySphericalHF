@@ -6,6 +6,7 @@ import sys, os
 import utils, solvers
 
 import numpy as np
+import multiprocessing as mp
 
 class Main:
     def __init__(self,edf,basis,nParticles,r,bz,bp,
@@ -26,22 +27,46 @@ class Main:
         
         self.densitiesToConstruct = densitiesToConstruct
     
+    def _atomic_hfb_matrix(self,fields,chemPot):
+        arrObj = solvers.HFBMatrix(self.basis,self.xi,self.eta,self.wz,self.wr)
+
+        phFields = {}
+        ppFields = {}
+        for (key,arr) in fields.items():
+            if key in utils.VariableNames.phKeys:
+                phFields[key] = arr
+            elif key in utils.VariableNames.ppKeys:
+                ppFields[key] = arr
+
+        return arrObj.make_hfb_matrix(phFields,ppFields,self.bz,self.bp,chemPot)
+
     @utils.timer
     def make_hfb_matrix(self,fields,chemPot):
-        hfbArrDict = {'p':[],'n':[]}
-        for pn in ['n','p']:
-            arrObj = solvers.HFBMatrix(self.basis,self.xi,self.eta,self.wz,self.wr)
-
-            phFields = {}
-            ppFields = {}
-            for (key,arr) in fields[pn].items():
-                if key in utils.VariableNames.phKeys:
-                    phFields[key] = arr
-                elif key in utils.VariableNames.ppKeys:
-                    ppFields[key] = arr
-
-            hfbArrDict[pn] = arrObj.make_hfb_matrix(phFields,ppFields,self.bz,self.bp,chemPot[pn])
+        args = [[fields['p'],chemPot['p']],
+                [fields['n'],chemPot['n']]]
+        with mp.Pool(2) as pool:
+            res = pool.starmap(self._atomic_hfb_matrix,args)
+        
+        hfbArrDict = {'p':res[0],'n':res[1]}
+        
         return hfbArrDict
+    
+    # @utils.timer
+    # def make_hfb_matrix(self,fields,chemPot):
+    #     hfbArrDict = {'p':[],'n':[]}
+    #     for pn in ['n','p']:
+    #         arrObj = solvers.HFBMatrix(self.basis,self.xi,self.eta,self.wz,self.wr)
+
+    #         phFields = {}
+    #         ppFields = {}
+    #         for (key,arr) in fields[pn].items():
+    #             if key in utils.VariableNames.phKeys:
+    #                 phFields[key] = arr
+    #             elif key in utils.VariableNames.ppKeys:
+    #                 ppFields[key] = arr
+
+    #         hfbArrDict[pn] = arrObj.make_hfb_matrix(phFields,ppFields,self.bz,self.bp,chemPot[pn])
+    #     return hfbArrDict
 
     @utils.timer
     def diagonalize_hfb_matrix(self,hfbArrDict):
